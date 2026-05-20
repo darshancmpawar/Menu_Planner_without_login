@@ -43,11 +43,13 @@ from customisation.main import render_customisation_editor
 
 logger = logging.getLogger(__name__)
 
-# Solver wall-clock budget scales with plan length: 36 s/day, floored at
-# 180 s (5-day baseline) and capped at the API's 600 s ceiling.
-# 10 days → 360 s → 45 s per CP-SAT restart attempt (vs 22.5 s before).
+# Solver wall-clock budget scales dynamically with plan length.
+# Formula: 40 s/day, floored at 60 s, capped at the API's 600 s ceiling.
+# The solver internally splits this across 8 restart attempts and enforces
+# a 20 s per-attempt floor — so short plans finish quickly while long
+# plans (10–15 days) get the headroom CP-SAT needs for a quality solution.
 def _planning_time_limit(num_days: int) -> int:
-    return min(600, max(180, 36 * num_days))
+    return min(600, max(60, num_days * 40))
 
 
 def _render_view_error(view_name: str, exc: BaseException) -> None:
