@@ -362,40 +362,50 @@ class MenuSolver:
     def _build_failure_message(
         outcomes: Dict[str, int], total: int, per_attempt_sec: float,
     ) -> str:
-        """Pick the most actionable error message based on per-attempt failure mix."""
+        """Pick the most actionable error message based on per-attempt failure mix.
+
+        Aimed at non-technical users: lead with what went wrong in plain
+        English, then give one or two concrete next steps they can try.
+        """
         tl = outcomes.get('time_limit', 0)
         inf = outcomes.get('infeasible', 0)
         ep = outcomes.get('empty_pool', 0)
 
         if tl == total and total > 0:
             return (
-                f'Solver timed out on all {total} attempts ({int(per_attempt_sec)} s each). '
-                f'The plan is likely solvable but the time budget is too tight. '
-                f'Try a shorter plan, raise the time limit, or simplify the rules.'
+                "Plan generation took too long to finish. "
+                "This usually happens on longer plans (8+ days). "
+                "Try generating a shorter plan (e.g. 5 days), or split your range "
+                "into two smaller plans and generate them separately."
             )
         if inf == total and total > 0:
             return (
-                f'Plan is infeasible on all {total} attempts — the constraints '
-                f'conflict and no valid menu exists. Check the rule diagnostics '
-                f'(item cooldown, theme filter, rice-bread gap, premium/color limits).'
+                "Can't build a valid menu with the current rules and items. "
+                "There aren't enough unique items to satisfy every constraint "
+                "(themes, item cooldown, colours, premium limits). "
+                "Try one of: (1) generate a shorter plan, "
+                "(2) add more items to the client's menu, "
+                "or (3) lower the item cooldown so items can repeat sooner. "
+                "Open the diagnostics panel to see which rule is the tightest fit."
             )
         if ep == total and total > 0:
             return (
-                f'Empty candidate pool on every attempt — pre-filters '
-                f'(cooldown / rice-bread gap / theme filter) removed all '
-                f'candidates from at least one slot. See diagnostics.'
+                "A menu slot ran out of options after filtering "
+                "(item cooldown, rice-bread gap, or theme filter removed everything). "
+                "Open the diagnostics panel — it will name the exact slot and date. "
+                "Fix: add more items for that slot, or shorten the cooldown."
             )
+        # Mixed failure: report the breakdown so support can debug.
         parts = []
-        if tl: parts.append(f'{tl} timed out')
-        if inf: parts.append(f'{inf} infeasible')
-        if ep: parts.append(f'{ep} empty pool')
+        if tl: parts.append(f"{tl} timed out")
+        if inf: parts.append(f"{inf} found no valid menu")
+        if ep: parts.append(f"{ep} ran out of candidates")
         if outcomes.get('other'): parts.append(f"{outcomes['other']} other")
-        mix = ', '.join(parts) if parts else 'unknown reasons'
+        mix = ", ".join(parts) if parts else "unknown reasons"
         return (
-            f'No feasible plan found after {total} CP-SAT restarts ({mix}). '
-            f'Mixed failure: some attempts timed out, some hit constraint '
-            f'conflicts. Check diagnostics first, then consider raising '
-            f'the time budget if attempts mostly timed out.'
+            f"Plan generation failed across {total} attempts ({mix}). "
+            "Try a shorter plan first — if that works, the longer plan likely "
+            "needs more time or looser rules. Otherwise check the diagnostics panel."
         )
 
     # ----- Cell building -----
