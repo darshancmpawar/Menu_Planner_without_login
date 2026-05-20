@@ -90,6 +90,12 @@ STYLES = """
         min-width: 300px !important;
         max-width: 300px !important;
     }
+    /* Push sidebar content down so the date-picker calendar (which
+       opens upward) has room to render its month/year header + nav
+       arrows without being clipped by the viewport. */
+    [data-testid="stSidebar"] > div:first-child {
+        padding-top: 4rem !important;
+    }
     [data-testid="stSidebar"] label {
         color: var(--text-secondary) !important;
         font-size: 0.78rem !important;
