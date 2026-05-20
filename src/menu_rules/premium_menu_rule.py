@@ -1,7 +1,15 @@
 """
-Premium menu rule: max 1 premium item per day, 1-2 per week.
+Premium menu rule: max 1 premium item per day, scaled premium days per horizon.
+
+``min_per_horizon`` and ``max_per_horizon`` in the config are treated as
+the rate per 5-day baseline week. For plans longer than 5 days the limits
+scale proportionally (10-day plan → 2× the baseline). This keeps the
+"premium items are sparse but present" intent constant regardless of
+plan length, instead of an absolute ceiling that gets stricter as plans
+grow.
 """
 
+import math
 from typing import Dict, Any, List
 from ortools.sat.python import cp_model
 from .base_menu_rule import (
@@ -13,6 +21,10 @@ from .base_menu_rule import (
     MenuRuleType,
 )
 from src.constants import BASE_SLOT_NAMES
+
+
+# Baseline week length the per-horizon limits in the rule config are tuned for.
+_BASELINE_DAYS = 5
 
 
 class PremiumMenuRule(BaseMenuRule):
@@ -59,6 +71,23 @@ class PremiumMenuRule(BaseMenuRule):
             )
         return errs
 
+    def effective_limits(self, num_days: int) -> tuple[int, int]:
+        """Return (min, max) premium days for a horizon of ``num_days``.
+
+        Scales the configured per-5-day rates linearly; plans of 5 days
+        or fewer keep the configured baseline so existing weekly behavior
+        is unchanged.
+        """
+        if num_days <= _BASELINE_DAYS:
+            return self.min_per_horizon, self.max_per_horizon
+        scale = num_days / _BASELINE_DAYS
+        eff_min = math.ceil(self.min_per_horizon * scale)
+        eff_max = math.ceil(self.max_per_horizon * scale)
+        # Defensive: never let scaling invert the range.
+        if eff_min > eff_max:
+            eff_min = eff_max
+        return eff_min, eff_max
+
     def apply(self, model: cp_model.CpModel, variables: Dict[str, Any],
               menu_data: Any, context: Dict[str, Any]) -> None:
         cfg = context.get('cfg')
@@ -67,6 +96,8 @@ class PremiumMenuRule(BaseMenuRule):
 
         if not cfg or not cfg.premium_flag_col:
             return
+
+        eff_min, eff_max = self.effective_limits(len(dates))
 
         premium_day_bools = []
         for di in range(len(dates)):
@@ -82,8 +113,8 @@ class PremiumMenuRule(BaseMenuRule):
         total = sum(premium_day_bools)
         has_any = any(len(day_premium_vars.get(di, [])) > 0 for di in range(len(dates)))
         if has_any:
-            model.Add(total >= self.min_per_horizon)
-            model.Add(total <= self.max_per_horizon)
+            model.Add(total >= eff_min)
+            model.Add(total <= eff_max)
         else:
             model.Add(total == 0)
 
@@ -99,17 +130,21 @@ class PremiumMenuRule(BaseMenuRule):
           - WARNING when premium_count < min_per_horizon (CP-SAT
             cannot promote enough premium days; multi-restart will
             eventually fail).
+
+        Effective limits are scaled by horizon length so a 10-day plan
+        gets min=2, max=4 instead of the configured per-5-day baseline.
         """
         diags: List[Diagnostic] = []
+        eff_min, eff_max = self.effective_limits(len(ctx.dates))
         flag_col = ctx.cfg.premium_flag_col if ctx.cfg else None
         if not flag_col:
-            if self.min_per_horizon > 0:
+            if eff_min > 0:
                 diags.append(Diagnostic(
                     rule=self.name, rule_type=self.rule_type.value,
                     severity=DiagnosticSeverity.ERROR,
                     phase=DiagnosticPhase.APPLY,
                     message=(
-                        f"Premium rule requires ≥{self.min_per_horizon} "
+                        f"Premium rule requires ≥{eff_min} "
                         f"premium day(s) but no premium_flag_col is "
                         f"configured. The constraint will silently drop."
                     ),
@@ -118,7 +153,7 @@ class PremiumMenuRule(BaseMenuRule):
                         "name (e.g. 'is_premium_veg'), or set "
                         "min_per_horizon=0 in the rule config."
                     ),
-                    affected={'min_per_horizon': self.min_per_horizon},
+                    affected={'min_per_horizon': eff_min},
                 ))
             return diags
 
@@ -139,43 +174,45 @@ class PremiumMenuRule(BaseMenuRule):
             per_day_counts[d.isoformat()] = day_count
             total_premium += day_count
 
-        if self.min_per_horizon > 0 and total_premium == 0:
+        if eff_min > 0 and total_premium == 0:
             diags.append(Diagnostic(
                 rule=self.name, rule_type=self.rule_type.value,
                 severity=DiagnosticSeverity.ERROR,
                 phase=DiagnosticPhase.APPLY,
                 message=(
-                    f"Premium rule requires ≥{self.min_per_horizon} "
-                    f"premium day(s), but no items in any slot pool have "
-                    f"{flag_col}=1."
+                    f"Premium rule requires ≥{eff_min} "
+                    f"premium day(s) for a {len(ctx.dates)}-day plan, "
+                    f"but no items in any slot pool have {flag_col}=1."
                 ),
                 suggestion=(
-                    f"Add at least {self.min_per_horizon} premium item"
-                    f"{'s' if self.min_per_horizon != 1 else ''} to the "
+                    f"Add at least {eff_min} premium item"
+                    f"{'s' if eff_min != 1 else ''} to the "
                     f"ontology (set {flag_col}=1)."
                 ),
                 affected={
-                    'min_per_horizon': self.min_per_horizon,
+                    'min_per_horizon': eff_min,
+                    'max_per_horizon': eff_max,
                     'flag_col': flag_col,
                     'total_premium': 0,
                 },
             ))
-        elif total_premium and self.min_per_horizon > 0:
+        elif total_premium and eff_min > 0:
             # Count days that *could* be premium (at least one premium
             # item in a non-skipped slot). The constraint is per-day,
             # so this is the right metric — not the raw item count.
             premium_capable_days = sum(
                 1 for c in per_day_counts.values() if c > 0
             )
-            if premium_capable_days < self.min_per_horizon:
+            if premium_capable_days < eff_min:
                 diags.append(Diagnostic(
                     rule=self.name, rule_type=self.rule_type.value,
                     severity=DiagnosticSeverity.ERROR,
                     phase=DiagnosticPhase.APPLY,
                     message=(
-                        f"Premium rule needs ≥{self.min_per_horizon} "
-                        f"premium day(s), but only {premium_capable_days} "
-                        f"of {len(ctx.dates)} dates can carry a premium "
+                        f"Premium rule needs ≥{eff_min} "
+                        f"premium day(s) for a {len(ctx.dates)}-day plan, "
+                        f"but only {premium_capable_days} of "
+                        f"{len(ctx.dates)} dates can carry a premium "
                         f"item (the others have 0 items with "
                         f"{flag_col}=1 in any slot pool)."
                     ),
@@ -184,7 +221,8 @@ class PremiumMenuRule(BaseMenuRule):
                         "filters, or relax min_per_horizon."
                     ),
                     affected={
-                        'min_per_horizon': self.min_per_horizon,
+                        'min_per_horizon': eff_min,
+                        'max_per_horizon': eff_max,
                         'premium_capable_days': premium_capable_days,
                         'total_dates': len(ctx.dates),
                     },
