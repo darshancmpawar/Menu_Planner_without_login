@@ -43,12 +43,11 @@ from customisation.main import render_customisation_editor
 
 logger = logging.getLogger(__name__)
 
-# Streamlit-side cap on solver wall-clock per request. The API itself
-# accepts up to MAX_TIME_LIMIT_SECONDS; we send a tighter value so a
-# single slow request doesn't pin a worker for the full 10-minute API
-# ceiling. Tuned against the 5-day default plan; revisit if num_days
-# grows or rule count balloons.
-_PLANNING_TIME_LIMIT_SECONDS = 180
+# Solver wall-clock budget scales with plan length: 36 s/day, floored at
+# 180 s (5-day baseline) and capped at the API's 600 s ceiling.
+# 10 days → 360 s → 45 s per CP-SAT restart attempt (vs 22.5 s before).
+def _planning_time_limit(num_days: int) -> int:
+    return min(600, max(180, 36 * num_days))
 
 
 def _render_view_error(view_name: str, exc: BaseException) -> None:
@@ -430,7 +429,7 @@ if generate_clicked:
                         client_name=selected_client,
                         start_date=start_date.isoformat(),
                         num_days=num_days,
-                        time_limit_seconds=_PLANNING_TIME_LIMIT_SECONDS,
+                        time_limit_seconds=_planning_time_limit(num_days),
                     )
                     flat_plan, day_types = flatten_api_solution(result.get("solution", {}))
                     st.session_state.plan = flat_plan
@@ -687,7 +686,7 @@ if plan and plan_dates:
                             base_plan=plan, replace_slots=regen_selections,
                             start_date=plan_dates[0],
                             num_days=len(plan_dates),
-                            time_limit_seconds=_PLANNING_TIME_LIMIT_SECONDS)
+                            time_limit_seconds=_planning_time_limit(len(plan_dates)))
                         flat_regen, regen_day_types = flatten_api_solution(result.get("solution", {}))
                         st.session_state.plan = flat_regen if flat_regen else plan
                         if regen_day_types:
