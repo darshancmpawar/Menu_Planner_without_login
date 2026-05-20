@@ -301,6 +301,11 @@ class MenuSolver:
         total_time = float(self.cfg.time_limit_sec)
         per_attempt_time = max(20.0, total_time / (len(cap_multipliers) * restarts_per_mult))
         last_err = None
+        # Per-attempt failure tally — used to pick a specific, actionable
+        # final error message instead of the generic "likely causes" string.
+        attempt_outcomes: Dict[str, int] = {
+            'time_limit': 0, 'infeasible': 0, 'empty_pool': 0, 'other': 0,
+        }
         orig_seed, orig_time = self.cfg.seed, self.cfg.time_limit_sec
 
         try:
@@ -335,16 +340,73 @@ class MenuSolver:
                         return week_plan, dates
                     except RuntimeError as e:
                         last_err = e
+                        msg = str(e).lower()
+                        if 'time limit' in msg:
+                            attempt_outcomes['time_limit'] += 1
+                        elif 'infeasible' in msg:
+                            attempt_outcomes['infeasible'] += 1
+                        elif 'empty pool' in msg:
+                            attempt_outcomes['empty_pool'] += 1
+                        else:
+                            attempt_outcomes['other'] += 1
                         continue
 
+            total_attempts = sum(attempt_outcomes.values())
             raise RuntimeError(
-                'No feasible plan found after CP-SAT restarts. '
-                'Likely causes: tight history cooldown, rice-bread gap, '
-                'insufficient deep-fried starters, tight Chinese/Biryani pools, '
-                'or color/premium constraints.'
+                self._build_failure_message(attempt_outcomes, total_attempts, per_attempt_time)
             ) from last_err
         finally:
             self.cfg.seed, self.cfg.time_limit_sec = orig_seed, orig_time
+
+    @staticmethod
+    def _build_failure_message(
+        outcomes: Dict[str, int], total: int, per_attempt_sec: float,
+    ) -> str:
+        """Pick the most actionable error message based on per-attempt failure mix.
+
+        Aimed at non-technical users: lead with what went wrong in plain
+        English, then give one or two concrete next steps they can try.
+        """
+        tl = outcomes.get('time_limit', 0)
+        inf = outcomes.get('infeasible', 0)
+        ep = outcomes.get('empty_pool', 0)
+
+        if tl == total and total > 0:
+            return (
+                "Plan generation took too long to finish. "
+                "This usually happens on longer plans (8+ days). "
+                "Try generating a shorter plan (e.g. 5 days), or split your range "
+                "into two smaller plans and generate them separately."
+            )
+        if inf == total and total > 0:
+            return (
+                "Can't build a valid menu with the current rules and items. "
+                "There aren't enough unique items to satisfy every constraint "
+                "(themes, item cooldown, colours, premium limits). "
+                "Try one of: (1) generate a shorter plan, "
+                "(2) add more items to the client's menu, "
+                "or (3) lower the item cooldown so items can repeat sooner. "
+                "Open the diagnostics panel to see which rule is the tightest fit."
+            )
+        if ep == total and total > 0:
+            return (
+                "A menu slot ran out of options after filtering "
+                "(item cooldown, rice-bread gap, or theme filter removed everything). "
+                "Open the diagnostics panel — it will name the exact slot and date. "
+                "Fix: add more items for that slot, or shorten the cooldown."
+            )
+        # Mixed failure: report the breakdown so support can debug.
+        parts = []
+        if tl: parts.append(f"{tl} timed out")
+        if inf: parts.append(f"{inf} found no valid menu")
+        if ep: parts.append(f"{ep} ran out of candidates")
+        if outcomes.get('other'): parts.append(f"{outcomes['other']} other")
+        mix = ", ".join(parts) if parts else "unknown reasons"
+        return (
+            f"Plan generation failed across {total} attempts ({mix}). "
+            "Try a shorter plan first — if that works, the longer plan likely "
+            "needs more time or looser rules. Otherwise check the diagnostics panel."
+        )
 
     # ----- Cell building -----
 
