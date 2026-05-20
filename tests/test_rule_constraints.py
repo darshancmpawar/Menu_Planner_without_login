@@ -12,6 +12,7 @@ from ortools.sat.python import cp_model
 
 from src.menu_rules.coupling_menu_rule import CouplingMenuRule
 from src.menu_rules.curd_side_menu_rule import CurdSideMenuRule
+from src.menu_rules.nonveg_rules import NonvegBiryaniWeeklyRule
 from src.menu_rules.premium_menu_rule import PremiumMenuRule
 from src.menu_rules.theme_rules import (
     ThemeDayMenuRule, ThemeStarterPreferenceRule,
@@ -257,6 +258,116 @@ class TestPremiumConstraint:
         _, status = _solve(model)
         # eff_max = ceil(10/5 * 2) = 4, so 4 premium days fits
         assert status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+
+
+# ---------------------------------------------------------------------------
+# NonvegBiryaniWeeklyRule — biryani-per-week cap with horizon scaling
+# ---------------------------------------------------------------------------
+
+class TestNonvegBiryaniWeeklyConstraint:
+    def _make_cell(self, di, biryani_flags):
+        """Build a _FakeCell whose candidate rows carry is_nonveg_biryani."""
+        rows = [{'item': f'item_{di}_{i}', 'is_nonveg_biryani': f}
+                for i, f in enumerate(biryani_flags)]
+        model = cp_model.CpModel()  # placeholder, replaced by caller
+        xs = []  # filled by caller
+        return rows, xs
+
+    def test_static_cap_blocks_two_biryani_days(self):
+        """Baseline cap=1 used as a pure per-horizon cap would force at
+        most 1 biryani day even on a 10-day plan. This verifies the
+        scaled cap relaxes that — required so 10-day plans with 2
+        biryani Wednesdays can solve."""
+        model = cp_model.CpModel()
+        dates = [dt.date(2026, 4, 6) + dt.timedelta(days=i) for i in range(10)]
+        cells = []
+        # Each "day" gets one nonveg_main cell with one candidate marked
+        # as biryani — forcing it to be picked exercises the per-day
+        # boolean wiring inside NonvegBiryaniWeeklyRule.apply().
+        for di in range(10):
+            x = model.NewBoolVar(f'x_{di}')
+            model.Add(x == 1)  # force biryani item every day
+            cells.append(_FakeCell(
+                d_idx=di, date=dates[di], slot_id='nonveg_main',
+                base_slot='nonveg_main',
+                rows=[{'item': f'biryani_{di}', 'is_nonveg_biryani': 1}],
+                x_vars=[x],
+            ))
+
+        rule = NonvegBiryaniWeeklyRule({
+            'name': 'bir', 'type': 'nonveg_biryani_weekly',
+            'max_per_week': 1,
+        })
+        ctx = {'cells': cells, 'dates': dates, 'link_any_fn': _link_any}
+        rule.apply(model, {}, None, ctx)
+
+        _, status = _solve(model)
+        # Effective cap on a 10-day plan is ceil(1 * 10/5) = 2, so 10
+        # forced biryani days remain infeasible — but the previous
+        # static cap of 1 would have made even a 2-biryani-day plan
+        # infeasible. The point of the scaling is that 2 days fit.
+        assert status == cp_model.INFEASIBLE
+
+    def test_two_biryani_days_feasible_on_10_day_plan(self):
+        """The Stripe failure mode: 2 Biryani Wednesdays in a 10-day
+        plan must be feasible. With the scaling fix, effective_max=2
+        on a 10-day horizon, so two forced biryani days solve."""
+        model = cp_model.CpModel()
+        dates = [dt.date(2026, 4, 6) + dt.timedelta(days=i) for i in range(10)]
+        cells = []
+        # Force exactly 2 of the 10 days to contain a biryani item;
+        # the other days have a single non-biryani candidate.
+        biryani_day_indices = {2, 7}
+        for di in range(10):
+            x = model.NewBoolVar(f'x_{di}')
+            model.Add(x == 1)
+            is_bir = 1 if di in biryani_day_indices else 0
+            cells.append(_FakeCell(
+                d_idx=di, date=dates[di], slot_id='nonveg_main',
+                base_slot='nonveg_main',
+                rows=[{'item': f'item_{di}', 'is_nonveg_biryani': is_bir}],
+                x_vars=[x],
+            ))
+
+        rule = NonvegBiryaniWeeklyRule({
+            'name': 'bir', 'type': 'nonveg_biryani_weekly',
+            'max_per_week': 1,
+        })
+        ctx = {'cells': cells, 'dates': dates, 'link_any_fn': _link_any}
+        rule.apply(model, {}, None, ctx)
+
+        _, status = _solve(model)
+        # 2 biryani days, scaled cap = 2 → feasible.
+        assert status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+
+    def test_two_biryani_days_infeasible_on_5_day_plan(self):
+        """5-day baseline keeps the configured cap=1, so trying to
+        force 2 biryani days on a 5-day plan still fails (preserves
+        existing behavior for short plans)."""
+        model = cp_model.CpModel()
+        dates = [dt.date(2026, 4, 6) + dt.timedelta(days=i) for i in range(5)]
+        cells = []
+        for di in range(5):
+            x = model.NewBoolVar(f'x_{di}')
+            model.Add(x == 1)
+            is_bir = 1 if di in (1, 3) else 0
+            cells.append(_FakeCell(
+                d_idx=di, date=dates[di], slot_id='nonveg_main',
+                base_slot='nonveg_main',
+                rows=[{'item': f'item_{di}', 'is_nonveg_biryani': is_bir}],
+                x_vars=[x],
+            ))
+
+        rule = NonvegBiryaniWeeklyRule({
+            'name': 'bir', 'type': 'nonveg_biryani_weekly',
+            'max_per_week': 1,
+        })
+        ctx = {'cells': cells, 'dates': dates, 'link_any_fn': _link_any}
+        rule.apply(model, {}, None, ctx)
+
+        _, status = _solve(model)
+        # eff_max(5) = 1, so 2 biryani days remains infeasible.
+        assert status == cp_model.INFEASIBLE
 
 
 # ---------------------------------------------------------------------------

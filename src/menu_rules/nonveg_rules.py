@@ -2,7 +2,10 @@
 Non-veg menu rules.
 
 * :class:`NonvegBiryaniWeeklyRule` — CP-SAT cap: at most N nonveg
-  biryani days across the week.
+  biryani days across the week. ``max_per_week`` is the per-5-day rate;
+  for plans longer than 5 days the cap scales proportionally (a 10-day
+  plan permits 2× the configured baseline) so the rule does not collide
+  with the theme schedule's repeated Biryani Wednesdays.
 * :class:`NonvegDryPreferenceRule` — pre-filter: for nonveg_main slot
   2+, prefer dry items; fall back to gravy; on biryani/chinese days
   exclude the theme items (those go in slot 1) first.
@@ -11,6 +14,7 @@ Non-veg menu rules.
 from __future__ import annotations
 
 import datetime as dt
+import math
 from typing import Any, Dict, List
 
 import pandas as pd
@@ -25,6 +29,12 @@ from .base_menu_rule import (
     DiagnoseContext,
     MenuRuleType,
 )
+
+
+# Baseline week length the per-week cap in the rule config is tuned for.
+# Mirrors PremiumMenuRule._BASELINE_DAYS — keeps both horizon-scoped
+# limits scaling on the same yardstick.
+_BASELINE_DAYS = 5
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +59,20 @@ class NonvegBiryaniWeeklyRule(BaseMenuRule):
 
     def validate_config(self) -> bool:
         return self.max_per_week >= 0
+
+    def effective_max(self, num_days: int) -> int:
+        """Cap scaled to ``num_days``.
+
+        The configured ``max_per_week`` describes the baseline 5-day
+        week. For longer horizons the theme calendar repeats Wednesday
+        Biryani every week, and ``ThemeSlotFilterRule`` forces slot 1
+        on those days to be a biryani item — so the cap must grow with
+        the plan or the model becomes infeasible.
+        """
+        if num_days <= _BASELINE_DAYS:
+            return self.max_per_week
+        scale = num_days / _BASELINE_DAYS
+        return max(self.max_per_week, math.ceil(self.max_per_week * scale))
 
     def apply(self, model: cp_model.CpModel, variables: Dict[str, Any],
               menu_data: Any, context: Dict[str, Any]) -> None:
@@ -78,21 +102,23 @@ class NonvegBiryaniWeeklyRule(BaseMenuRule):
                 biryani_day_vars.append(day_has_biryani)
 
         if biryani_day_vars:
-            model.Add(sum(biryani_day_vars) <= self.max_per_week)
+            model.Add(sum(biryani_day_vars) <= self.effective_max(len(dates)))
 
     def diagnose(self, ctx: DiagnoseContext) -> List[Diagnostic]:
         """Constraint is ``sum(nonveg_biryani_day_vars) <= max_per_week``.
 
         Emits INFO when the constraint is a no-op (no
         ``is_nonveg_biryani=1`` items anywhere) so users can see why
-        their cap isn't doing anything, and WARNING when the rule is
-        on but no nonveg_main slot exists in any pool / skip_cells
-        zeroes it out entirely.
+        their cap isn't doing anything, and ERROR when the count of
+        biryani-themed days on the horizon exceeds the effective cap —
+        which the theme filter would force-fail since slot 1 on a
+        Biryani day MUST carry a biryani item.
         """
         diags: List[Diagnostic] = []
         pool = ctx.pools.get('nonveg_main')
         if pool is None:
             return diags
+        eff_max = self.effective_max(len(ctx.dates))
         if 'is_nonveg_biryani' not in pool.columns:
             diags.append(Diagnostic(
                 rule=self.name, rule_type=self.rule_type.value,
@@ -128,6 +154,46 @@ class NonvegBiryaniWeeklyRule(BaseMenuRule):
                 affected={
                     'max_per_week': self.max_per_week,
                     'biryani_count': 0,
+                },
+            ))
+            return diags
+
+        # Biryani-themed days the schedule will produce on this horizon.
+        # If more days have biryani as their theme than the effective
+        # cap permits, slot 1 on the extra days has nothing legal to
+        # pick — model is infeasible. Catch it pre-flight.
+        biryani_days = sum(
+            1 for d in ctx.dates
+            if ctx.day_types.get(d) == 'biryani'
+            and (d, 'nonveg_main') not in ctx.skip_cells
+        )
+        if biryani_days > eff_max:
+            diags.append(Diagnostic(
+                rule=self.name, rule_type=self.rule_type.value,
+                severity=DiagnosticSeverity.ERROR,
+                phase=DiagnosticPhase.APPLY,
+                message=(
+                    f"Nonveg biryani cap allows {eff_max} biryani "
+                    f"day{'s' if eff_max != 1 else ''} on this "
+                    f"{len(ctx.dates)}-day plan, but the theme schedule "
+                    f"has {biryani_days} biryani-theme day"
+                    f"{'s' if biryani_days != 1 else ''}. Each one "
+                    f"requires a biryani item in nonveg_main slot 1 "
+                    f"(theme filter), so the cap and the theme rule "
+                    f"collide — plan is infeasible."
+                ),
+                suggestion=(
+                    f"Raise max_per_week so the scaled cap covers all "
+                    f"biryani days (current effective cap on "
+                    f"{len(ctx.dates)} days: {eff_max}), or shorten "
+                    f"the plan so only {eff_max} biryani day"
+                    f"{'s' if eff_max != 1 else ''} land in the horizon."
+                ),
+                affected={
+                    'max_per_week': self.max_per_week,
+                    'effective_max': eff_max,
+                    'biryani_days_on_horizon': biryani_days,
+                    'num_days': len(ctx.dates),
                 },
             ))
         return diags
