@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional, Set
 from flask import Flask, request, jsonify, g, has_request_context
 from flask_cors import CORS
 
-from api.concurrency import solver_gate, get_stats as _solver_stats
+from api.concurrency import solver_slot, get_stats as _solver_stats
 from api.rate_limit import rate_limit
 from api import metrics
 
@@ -559,7 +559,6 @@ def list_clients():
 
 @app.route('/api/v1/plan', methods=['POST'])
 @rate_limit("plan")
-@solver_gate
 def plan_menu():
     try:
         inputs = _prepare_solver_inputs(request.get_json() or {})
@@ -595,17 +594,26 @@ def plan_menu():
                 body['pool_warnings'] = pool_warnings
             return jsonify(body), 422
 
-        solver = MenuSolver(
-            pools=inputs.pools,
-            solver_config=inputs.cfg,
-            menu_rules=inputs.rules,
-            banned_by_date=inputs.banned,
-            ricebread_ban_day=inputs.rb_ban,
-            recent_sigs=inputs.recent_sigs,
-            skip_cells=inputs.skip_cells,
-        )
+        # Weighted admission control — sized by plan length so short plans
+        # don't queue behind heavy ones.
+        with solver_slot(inputs.cfg.days) as admitted:
+            if not admitted:
+                return jsonify({
+                    'success': False,
+                    'error': 'Solver busy — too many concurrent requests. Retry shortly.',
+                }), 503
 
-        week_plan, plan_dates = solver.solve()
+            solver = MenuSolver(
+                pools=inputs.pools,
+                solver_config=inputs.cfg,
+                menu_rules=inputs.rules,
+                banned_by_date=inputs.banned,
+                ricebread_ban_day=inputs.rb_ban,
+                recent_sigs=inputs.recent_sigs,
+                skip_cells=inputs.skip_cells,
+            )
+
+            week_plan, plan_dates = solver.solve()
 
         formatter = SolutionFormatter(
             week_plan, plan_dates, theme_map=inputs.client_cfg.theme_map or None,
@@ -645,7 +653,6 @@ def plan_menu():
 
 @app.route('/api/v1/regenerate', methods=['POST'])
 @rate_limit("regenerate")
-@solver_gate
 def regenerate_cells():
     try:
         data = request.get_json() or {}
@@ -667,18 +674,25 @@ def regenerate_cells():
             for d_str, slot_list in replace_slots_raw.items()
         }
 
-        regen = MenuRegenerator(
-            pools=inputs.pools,
-            df=inputs.df,
-            solver_config=inputs.cfg,
-            menu_rules=inputs.rules,
-            banned_by_date=inputs.banned,
-            ricebread_ban_day=inputs.rb_ban,
-            recent_sigs=inputs.recent_sigs,
-            skip_cells=inputs.skip_cells,
-        )
+        with solver_slot(inputs.cfg.days) as admitted:
+            if not admitted:
+                return jsonify({
+                    'success': False,
+                    'error': 'Solver busy — too many concurrent requests. Retry shortly.',
+                }), 503
 
-        week_plan, plan_dates = regen.regenerate(base_plan, replace_mask)
+            regen = MenuRegenerator(
+                pools=inputs.pools,
+                df=inputs.df,
+                solver_config=inputs.cfg,
+                menu_rules=inputs.rules,
+                banned_by_date=inputs.banned,
+                ricebread_ban_day=inputs.rb_ban,
+                recent_sigs=inputs.recent_sigs,
+                skip_cells=inputs.skip_cells,
+            )
+
+            week_plan, plan_dates = regen.regenerate(base_plan, replace_mask)
 
         formatter = SolutionFormatter(
             week_plan, plan_dates, theme_map=inputs.client_cfg.theme_map or None,
