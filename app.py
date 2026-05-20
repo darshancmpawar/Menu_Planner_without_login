@@ -39,17 +39,6 @@ from ui.formatters import (
 from ui.styles import STYLES
 from ui.backend_probe import health_check, pick_backend_port
 from customisation.main import render_customisation_editor
-from user_authentication.session import (
-    init_auth_state,
-    is_authenticated,
-    current_user,
-    current_token,
-    logout_user,
-    require_role,
-)
-from user_authentication.login_ui import render_login_form
-from user_authentication.user_manager_ui import render_user_manager
-from user_authentication.models import ROLE_SUPER_ADMIN, ROLE_ADMIN
 
 
 logger = logging.getLogger(__name__)
@@ -161,102 +150,6 @@ except RuntimeError as e:
     st.error(str(e))
     st.stop()
 
-# ---------------------------------------------------------------------------
-# Authentication gate — before anything else
-# ---------------------------------------------------------------------------
-init_auth_state()
-
-
-# Maximum warmup reruns we'll do before concluding "no cookie genuinely".
-# The JS→Python round-trip can take >150ms on slow networks (Streamlit
-# Cloud reverse proxy + WebSocket); a single rerun is not always enough.
-_COOKIE_WARMUP_KEY = "_ikigai_cookie_warmup_attempts"
-_COOKIE_WARMUP_MAX_ATTEMPTS = 5
-
-
-def _try_restore_session_from_cookie() -> bool:
-    """Rehydrate auth state from the persisted cookie on a fresh
-    Streamlit session (hard refresh, new tab, server restart).
-
-    The cookie component is async: ``getAll`` returns ``{}`` until the
-    component's JS has read ``document.cookie`` and posted the result
-    back over the Streamlit WebSocket. That round-trip happens *after*
-    the current script run ends, so a single warmup rerun isn't enough
-    when the network is slow — we'd rerun before the JS has posted.
-
-    Strategy: keep rerunning (with a short pause between attempts) up
-    to ``_COOKIE_WARMUP_MAX_ATTEMPTS`` times. As soon as ``getAll``
-    returns a non-empty dict, restore the session. If we exhaust the
-    budget, treat it as "no cookie" and show the login form — most
-    likely the user genuinely isn't logged in.
-
-    Returns True if a session was successfully restored. Has the side
-    effect of calling ``st.rerun()`` (and never returning) while warmup
-    is still in progress.
-    """
-    if is_authenticated():
-        return True
-
-    from user_authentication.cookie_store import (
-        get_all_cookies,
-        clear_persisted_token,
-        COOKIE_NAME,
-    )
-    from user_authentication.session import login_user
-    from user_authentication.models import User
-
-    cookies = get_all_cookies()
-    if cookies is None:
-        # Dep missing or Streamlit context unavailable — graceful
-        # degrade to "no persistence", login form will show.
-        return False
-
-    if not cookies:
-        # Either the cookie component is still warming up OR there is
-        # genuinely no cookie. Retry up to N times to disambiguate.
-        attempts = st.session_state.get(_COOKIE_WARMUP_KEY, 0)
-        if attempts < _COOKIE_WARMUP_MAX_ATTEMPTS:
-            st.session_state[_COOKIE_WARMUP_KEY] = attempts + 1
-            with st.spinner("Restoring your session…"):
-                # 250 ms × up to 5 attempts = ~1.25 s budget for the
-                # browser to post its cookies back. More than enough on
-                # any reasonable connection; bail out cleanly otherwise.
-                time.sleep(0.25)
-            st.rerun()
-        # Budget exhausted — treat as genuine "no cookie".
-        return False
-
-    token = cookies.get(COOKIE_NAME)
-    if not token:
-        return False
-
-    try:
-        probe = MenuApiClient(_BACKEND_URL, token=token)
-        info = probe.whoami()
-    except Exception:
-        # 401 (expired / forged) or backend hiccup. Either way drop
-        # the cookie so the user gets a clean login.
-        clear_persisted_token()
-        return False
-
-    login_user(
-        User(
-            email=info["email"],
-            profile_name=info.get("profile_name", ""),
-            role=info["role"],
-        ),
-        token=token,
-    )
-    return True
-
-
-_try_restore_session_from_cookie()
-
-if not is_authenticated():
-    render_login_form(_BACKEND_URL)
-    st.stop()
-
-
 # Streamlit reruns the entire script on every widget interaction, so a
 # naïve `MenuApiClient(_BACKEND_URL, token=...)` rebuilds a fresh
 # requests.Session on every click — connection pool, retry adapter,
@@ -265,22 +158,18 @@ if not is_authenticated():
 # below the bearer-token lifetime (24h) so a stale entry doesn't keep
 # a dead session around forever; logout also explicitly clears it.
 @st.cache_resource(ttl=23 * 3600, show_spinner=False)
-def _get_api_client(base_url: str, token: str | None) -> MenuApiClient:
-    return MenuApiClient(base_url, token=token)
+def _get_api_client(base_url: str) -> MenuApiClient:
+    return MenuApiClient(base_url)
 
 
-client = _get_api_client(_BACKEND_URL, current_token())
+client = _get_api_client(_BACKEND_URL)
 
 
 # Cache low-churn reads (60s TTL): the sidebar's client picker re-renders
-# on every interaction but the list itself only changes when an admin
-# creates/deletes a client. Underscore-prefixed args are excluded from
-# the hash key (Streamlit can't hash MenuApiClient); the trailing token
-# bucket keeps the cache per-user — different roles never see different
-# results today, but it's free insurance and gives clean isolation if
-# the backend ever scopes /clients per role.
+# on every interaction but the list itself only changes when a client is
+# created/deleted.
 @st.cache_data(ttl=60, show_spinner=False)
-def _cached_list_clients(_api: MenuApiClient, _bucket: str) -> list:
+def _cached_list_clients(_api: MenuApiClient) -> list:
     return _api.list_clients()
 
 # ---------------------------------------------------------------------------
@@ -311,13 +200,8 @@ for key, default in _SESSION_DEFAULTS.items():
     if key not in st.session_state:
         st.session_state[key] = default
 
-# Safety: if somehow view is set but user lacks permission, reset
-if st.session_state.view in ("editor", "user_manager"):
-    if not require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN):
-        st.session_state.view = "planner"
-
 # ---------------------------------------------------------------------------
-# Editor view (role-gated, full-page)
+# Editor view (full-page)
 # ---------------------------------------------------------------------------
 if st.session_state.view == "editor":
     try:
@@ -327,24 +211,6 @@ if st.session_state.view == "editor":
         # in client_rules.json, etc. Log + show a friendly fallback so
         # the user can navigate out instead of staring at a half-page.
         _render_view_error("editor", _exc)
-    st.stop()
-
-# ---------------------------------------------------------------------------
-# User manager view (role-gated, full-page)
-# ---------------------------------------------------------------------------
-if st.session_state.view == "user_manager":
-    col_back, col_title = st.columns([1, 5])
-    with col_back:
-        if st.button("< Back to Menu", key="um_back_btn", use_container_width=True):
-            st.session_state.view = "planner"
-            st.rerun()
-    with col_title:
-        st.markdown('<p class="page-title">User Management</p>', unsafe_allow_html=True)
-    st.markdown("")
-    try:
-        render_user_manager()
-    except Exception as _exc:
-        _render_view_error("user manager", _exc)
     st.stop()
 
 # ---------------------------------------------------------------------------
@@ -361,26 +227,8 @@ with st.sidebar:
         </div>
     </div>""", unsafe_allow_html=True)
 
-    # User chip
-    _user = current_user()
-    if _user:
-        initials = ''.join(w[0] for w in _user.profile_name.split()[:2]).upper() if _user.profile_name else '?'
-        st.markdown(
-            f'<div class="user-chip">'
-            f'<div class="user-avatar">{html.escape(initials)}</div>'
-            f'<div class="user-chip-info">'
-            f'<div class="user-chip-name">{html.escape(_user.profile_name or "")}</div>'
-            f'<div class="user-chip-role">{html.escape(_user.role or "")}</div>'
-            f'</div></div>',
-            unsafe_allow_html=True,
-        )
-        if st.button("Logout", key="sidebar_logout", use_container_width=True):
-            logout_user()
-            st.rerun()
-        st.divider()
-
     try:
-        clients_list = _cached_list_clients(client, current_token() or "anon")
+        clients_list = _cached_list_clients(client)
     except (ConnectionError, OSError, ValueError):
         clients_list = []
         st.error("Cannot reach API.")
@@ -529,17 +377,9 @@ with _hdr_col1:
             '<p class="page-subtitle">Select a client and generate a plan to get started</p>',
             unsafe_allow_html=True)
 with _hdr_col2:
-    btn_cols = st.columns(2)
-    with btn_cols[0]:
-        if require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN):
-            if st.button("Edit Logic", key="open_editor_btn", use_container_width=True):
-                st.session_state.view = "editor"
-                st.rerun()
-    with btn_cols[1]:
-        if require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN):
-            if st.button("Users", key="open_users_btn", use_container_width=True):
-                st.session_state.view = "user_manager"
-                st.rerun()
+    if st.button("Edit Logic", key="open_editor_btn", use_container_width=True):
+        st.session_state.view = "editor"
+        st.rerun()
 
 # ---------------------------------------------------------------------------
 # Generate

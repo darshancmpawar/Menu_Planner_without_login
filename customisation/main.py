@@ -13,9 +13,6 @@ from ui.api_client import MenuApiClient
 from customisation.slot_editor import render_slot_editor
 from customisation.multi_slot_editor import render_multi_slot_editor
 from customisation.theme_editor import render_theme_editor
-from user_authentication.session import require_role
-from user_authentication.models import ROLE_SUPER_ADMIN, ROLE_ADMIN
-
 
 def _inject_editor_css():
     st.markdown("""
@@ -291,11 +288,7 @@ def render_customisation_editor(api: MenuApiClient):
             st.rerun()
 
     else:
-        can_delete = require_role(ROLE_SUPER_ADMIN, ROLE_ADMIN)
-        if can_delete:
-            col_save, col_reset, col_delete = st.columns(3)
-        else:
-            col_save, col_reset = st.columns(2)
+        col_save, col_reset, col_delete = st.columns(3)
 
         with col_save:
             save_clicked = st.button(
@@ -309,13 +302,11 @@ def render_customisation_editor(api: MenuApiClient):
                 key="editor_reset_all", use_container_width=True,
             )
 
-        delete_clicked = False
-        if can_delete:
-            with col_delete:
-                delete_clicked = st.button(
-                    "Delete Client",
-                    key="editor_delete_btn", use_container_width=True,
-                )
+        with col_delete:
+            delete_clicked = st.button(
+                "Delete Client",
+                key="editor_delete_btn", use_container_width=True,
+            )
 
         if delete_clicked:
             try:

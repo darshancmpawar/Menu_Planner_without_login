@@ -22,7 +22,6 @@ from flask import Flask, request, jsonify, g, has_request_context
 from flask_cors import CORS
 
 from api.concurrency import solver_gate, get_stats as _solver_stats
-from api.auth import api_login, api_whoami, require_api_auth
 from api.rate_limit import rate_limit
 from api import metrics
 
@@ -46,7 +45,6 @@ configure_logging()
 # opaque KeyError or Supabase auth error on the first request — which
 # happens in production long after the process looked healthy.
 validate_required_env()
-from user_authentication.models import ROLE_ADMIN
 from src.preprocessor import ExcelReader, DataCleanser
 from src.preprocessor.pool_builder import PoolBuilder, _base_slot
 from src.constants import BASE_SLOT_NAMES, CONST_SLOTS, REPEATABLE_ITEM_BASES
@@ -137,10 +135,7 @@ def _trace_request_end(response):
     rid = getattr(g, "request_id", "-")
     response.headers["X-Request-ID"] = rid
 
-    # Principal email is populated by require_api_auth via g.api_user
-    # when auth passes; None for /health, /, and /auth/login.
-    api_user = getattr(g, "api_user", None)
-    user_email = (api_user or {}).get("email")
+    user_email = None
 
     # /health gets spammy fast — skip its access log unless it errored.
     if request.path == "/api/v1/health" and response.status_code < 400:
@@ -553,17 +548,7 @@ def _record_diag_metrics(diagnostics) -> None:
         )
 
 
-app.add_url_rule('/api/v1/auth/login', 'api_login', api_login, methods=['POST'])
-# /whoami is auth-gated — the decorator does the actual token validation;
-# the handler just echoes the decoded payload back.
-app.add_url_rule(
-    '/api/v1/auth/whoami', 'api_whoami',
-    require_api_auth()(api_whoami), methods=['GET'],
-)
-
-
 @app.route('/api/v1/clients', methods=['GET'])
-@require_api_auth()
 def list_clients():
     try:
         return jsonify({'success': True, 'clients': _request_client_names()})
@@ -573,7 +558,6 @@ def list_clients():
 
 
 @app.route('/api/v1/plan', methods=['POST'])
-@require_api_auth()
 @rate_limit("plan")
 @solver_gate
 def plan_menu():
@@ -660,7 +644,6 @@ def plan_menu():
 
 
 @app.route('/api/v1/regenerate', methods=['POST'])
-@require_api_auth()
 @rate_limit("regenerate")
 @solver_gate
 def regenerate_cells():
@@ -727,7 +710,6 @@ def regenerate_cells():
 
 
 @app.route('/api/v1/save', methods=['POST'])
-@require_api_auth()
 def save_plan():
     try:
         data = request.get_json(silent=True) or {}
@@ -845,7 +827,6 @@ def _enrich_history_plan(
 
 
 @app.route('/api/v1/saved-plan', methods=['GET'])
-@require_api_auth()
 def saved_plan():
     """Return the saved plan for a client + date range, if one exists.
 
@@ -923,7 +904,6 @@ def saved_plan():
 
 
 @app.route('/api/v1/editor-metadata', methods=['GET'])
-@require_api_auth()
 def editor_metadata():
     """Return metadata needed by the customisation editor UI."""
     try:
@@ -942,7 +922,6 @@ def editor_metadata():
 
 
 @app.route('/api/v1/client-config/<client_name>', methods=['GET'])
-@require_api_auth()
 def get_client_config(client_name):
     """Return the full editable config for one client.
 
@@ -998,7 +977,6 @@ def _expected_version(data: Dict[str, Any]) -> Optional[int]:
 
 
 @app.route('/api/v1/client-config/<client_name>', methods=['PUT'])
-@require_api_auth(min_role=ROLE_ADMIN)
 def update_client_config(client_name):
     """Update a client's configuration (slots, slot counts, theme overrides).
 
@@ -1061,7 +1039,6 @@ def update_client_config(client_name):
 
 
 @app.route('/api/v1/client', methods=['POST'])
-@require_api_auth(min_role=ROLE_ADMIN)
 def create_client():
     """Create a new client."""
     try:
@@ -1083,7 +1060,6 @@ def create_client():
 
 
 @app.route('/api/v1/client/<client_name>', methods=['DELETE'])
-@require_api_auth(min_role=ROLE_ADMIN)
 def delete_client(client_name):
     """Delete a client."""
     try:
@@ -1100,7 +1076,6 @@ def delete_client(client_name):
 
 
 @app.route('/api/v1/diagnose', methods=['POST'])
-@require_api_auth()
 def diagnose_plan():
     """Pre-flight rule diagnostic. Same body shape as /plan but never
     invokes the solver — returns structured ``rule_diagnostics`` so the
@@ -1206,7 +1181,6 @@ def _probe_supabase():
 
 
 @app.route('/api/v1/metrics', methods=['GET'])
-@require_api_auth()
 def metrics_snapshot():
     """Return a point-in-time snapshot of every in-process counter.
 
