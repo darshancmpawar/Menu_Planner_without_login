@@ -529,3 +529,74 @@ class TestNonvegBiryaniDiagnose:
         diags = rule.diagnose(ctx)
         # Constraint is a no-op (no biryani items) — INFO so users know.
         assert diags and diags[0].severity == DiagnosticSeverity.INFO
+
+    def test_effective_max_scales_with_plan_length(self):
+        # max_per_week=1 is the per-5-day baseline; longer horizons
+        # must lift the cap so 10-day plans (2 Biryani Wednesdays)
+        # don't collide with the theme schedule.
+        rule = NonvegBiryaniWeeklyRule({
+            'name': 'nv_birwk', 'type': 'nonveg_biryani_weekly',
+            'max_per_week': 1,
+        })
+        assert rule.effective_max(5) == 1
+        assert rule.effective_max(7) == 2
+        assert rule.effective_max(10) == 2
+        assert rule.effective_max(14) == 3
+
+    def test_error_when_biryani_days_exceed_cap(self):
+        # max_per_week=0 with 5 weekdays that include a Biryani
+        # Wednesday is the cleanest infeasibility case: cap forbids
+        # any biryani day, but the theme schedule mandates one.
+        # Diagnose must surface ERROR pre-flight so the user sees
+        # the structural conflict before the solver runs.
+        pool = pd.DataFrame({
+            'item': ['biryani_a'], 'is_nonveg_biryani': [1],
+        })
+        dates = [dt.date(2026, 4, 6) + dt.timedelta(days=i) for i in range(5)]
+        # Mon Apr 6 → ... → Fri Apr 10. Wed Apr 8 is the biryani day.
+        day_types = {
+            d: {'monday': 'mix', 'tuesday': 'chinese',
+                'wednesday': 'biryani', 'thursday': 'south',
+                'friday': 'north'}[d.strftime('%A').lower()]
+            for d in dates
+        }
+        ctx = _ctx(pools={'nonveg_main': pool}, dates=dates,
+                   day_types=day_types)
+        rule = NonvegBiryaniWeeklyRule({
+            'name': 'nv_birwk', 'type': 'nonveg_biryani_weekly',
+            'max_per_week': 0,
+        })
+        diags = rule.diagnose(ctx)
+        errors = [d for d in diags if d.severity == DiagnosticSeverity.ERROR]
+        assert len(errors) == 1
+        assert errors[0].affected['biryani_days_on_horizon'] == 1
+        assert errors[0].affected['effective_max'] == 0
+
+    def test_no_error_when_cap_covers_schedule(self):
+        # 10-day plan has 2 biryani Wednesdays; scaled cap also = 2.
+        # Cap exactly matches demand → no error.
+        pool = pd.DataFrame({
+            'item': ['biryani_a', 'biryani_b'],
+            'is_nonveg_biryani': [1, 1],
+        })
+        dates = []
+        d = dt.date(2026, 4, 6)
+        while len(dates) < 10:
+            if d.weekday() < 5:
+                dates.append(d)
+            d += dt.timedelta(days=1)
+        day_types = {
+            d: {'monday': 'mix', 'tuesday': 'chinese',
+                'wednesday': 'biryani', 'thursday': 'south',
+                'friday': 'north'}[d.strftime('%A').lower()]
+            for d in dates
+        }
+        ctx = _ctx(pools={'nonveg_main': pool}, dates=dates,
+                   day_types=day_types)
+        rule = NonvegBiryaniWeeklyRule({
+            'name': 'nv_birwk', 'type': 'nonveg_biryani_weekly',
+            'max_per_week': 2,  # raised cap
+        })
+        diags = rule.diagnose(ctx)
+        errors = [d for d in diags if d.severity == DiagnosticSeverity.ERROR]
+        assert not errors
