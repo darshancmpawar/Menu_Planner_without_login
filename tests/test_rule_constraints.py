@@ -223,6 +223,41 @@ class TestPremiumConstraint:
         _, status = _solve(model)
         assert status == cp_model.INFEASIBLE
 
+    def test_effective_limits_scale_with_plan_length(self):
+        """Configured ``max_per_horizon=2`` is per-5-day baseline; a 10-day
+        horizon scales to 4 so longer plans aren't disproportionately tight."""
+        rule = PremiumMenuRule({"name": "prem", "type": "premium",
+                                "max_per_day": 1, "min_per_horizon": 1, "max_per_horizon": 2})
+        # Baseline unchanged for ≤ 5 days
+        assert rule.effective_limits(5) == (1, 2)
+        assert rule.effective_limits(3) == (1, 2)
+        # 10 days = 2× baseline
+        assert rule.effective_limits(10) == (2, 4)
+        # 7 days rounds up: ceil(7/5 * 1)=2 min, ceil(7/5 * 2)=3 max
+        assert rule.effective_limits(7) == (2, 3)
+
+    def test_horizon_max_scales_for_10_day_plans(self):
+        """10-day plan with 4 forced premium days should be feasible after
+        scaling (was infeasible under the static max_per_horizon=2)."""
+        model = cp_model.CpModel()
+        prems = [model.NewBoolVar(f'p{i}') for i in range(10)]
+        # Force 4 days to be premium days
+        for i in range(4):
+            model.Add(prems[i] == 1)
+
+        rule = PremiumMenuRule({"name": "prem", "type": "premium",
+                                "max_per_day": 1, "min_per_horizon": 1, "max_per_horizon": 2})
+        ctx = {
+            'cfg': self._make_cfg(),
+            'dates': [dt.date(2026, 3, 23) + dt.timedelta(days=i) for i in range(10)],
+            'day_premium_vars': {i: [prems[i]] for i in range(10)},
+        }
+        rule.apply(model, {}, None, ctx)
+
+        _, status = _solve(model)
+        # eff_max = ceil(10/5 * 2) = 4, so 4 premium days fits
+        assert status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+
 
 # ---------------------------------------------------------------------------
 # CurdSideMenuRule — biryani/pulao/curd logic
