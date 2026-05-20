@@ -381,18 +381,24 @@ class ThemeSlotFilterRule(BaseMenuRule):
                         },
                     ))
 
-        # --- Multi-occurrence feasibility check (new) ---
+        # --- Multi-occurrence feasibility check ---
         # When a theme appears more than once (e.g. 2 Chinese Tuesdays in a
         # 9-day plan), the solver needs N *distinct* items for that
-        # (day_type, slot) — one per occurrence. Check that enough items
-        # survive both the theme filter AND the union of cooldown bans
-        # across all those occurrences. This is the cross-rule check that
-        # catches solver failures the individual per-rule diagnostics miss.
+        # (day_type, slot) — one per occurrence × slot_count. Check that
+        # enough items survive both the theme filter AND the union of
+        # cooldown bans across all those occurrences. This is the
+        # cross-rule check that catches solver failures the individual
+        # per-rule diagnostics miss.
         day_type_dates: Dict[str, List[dt.date]] = {}
         for d in ctx.dates:
             dt_ = ctx.day_types.get(d, '')
             if dt_ in ('chinese', 'biryani', 'south', 'north'):
                 day_type_dates.setdefault(dt_, []).append(d)
+
+        # slot_counts override per base slot (e.g. Stripe: nonveg_main=2)
+        slot_counts: Dict[str, int] = {}
+        if ctx.client_cfg is not None:
+            slot_counts = dict(getattr(ctx.client_cfg, 'slot_counts', {}) or {})
 
         for day_type, dates_of_type in day_type_dates.items():
             if len(dates_of_type) < 2:
@@ -407,7 +413,23 @@ class ThemeSlotFilterRule(BaseMenuRule):
 
                 occurrences = [d for d in dates_of_type
                                if (d, base) not in ctx.skip_cells]
-                n_needed = len(occurrences)
+                if len(occurrences) < 1:
+                    continue
+                # How many cells per day actually consume from the
+                # *themed* pool. For South / North themes the cuisine
+                # filter applies to every nonveg_main slot, so multiply
+                # by slot_count. For Chinese / Biryani themes on
+                # nonveg_main the themed filter only applies to slot 1
+                # (slot 2 is re-routed to a non-themed pool by
+                # NonvegDryPreferenceRule), so themed_cells_per_day = 1.
+                slot_count = slot_counts.get(base, 1)
+                if day_type in ('south', 'north'):
+                    themed_cells_per_day = slot_count
+                elif day_type in ('chinese', 'biryani') and base == 'nonveg_main':
+                    themed_cells_per_day = 1
+                else:
+                    themed_cells_per_day = slot_count
+                n_needed = len(occurrences) * themed_cells_per_day
                 if n_needed < 2:
                     continue
 
@@ -435,18 +457,23 @@ class ThemeSlotFilterRule(BaseMenuRule):
                         if n_remaining == 0
                         else DiagnosticSeverity.WARNING
                     )
+                    slot_detail = (
+                        f"{len(occurrences)} day{'s' if len(occurrences) != 1 else ''} "
+                        f"× {themed_cells_per_day} {slot_label} slot"
+                        f"{'s' if themed_cells_per_day != 1 else ''}/day"
+                    )
                     diags.append(Diagnostic(
                         rule=self.name,
                         rule_type=self.rule_type.value,
                         severity=severity,
                         phase=DiagnosticPhase.PRE_FILTER,
                         message=(
-                            f"{day_type.capitalize()} theme appears {n_needed}× "
-                            f"in this plan ({date_strs}), but only {n_remaining} "
-                            f"{slot_label} item{'s' if n_remaining != 1 else ''} "
-                            f"survive both the {day_type} theme filter and the "
-                            f"recent-history cooldown. Solver needs {n_needed} "
-                            f"distinct items — plan will likely fail."
+                            f"{day_type.capitalize()} theme needs {n_needed} "
+                            f"distinct {slot_label} item{'s' if n_needed != 1 else ''} "
+                            f"({slot_detail} on {date_strs}), but only "
+                            f"{n_remaining} survive both the {day_type} theme "
+                            f"filter and the recent-history cooldown. "
+                            f"Plan will fail."
                         ),
                         suggestion=(
                             f"Add more {day_type}-tagged {slot_label} items to "
@@ -457,7 +484,9 @@ class ThemeSlotFilterRule(BaseMenuRule):
                         affected={
                             'slot': base,
                             'day_type': day_type,
-                            'occurrences_needed': n_needed,
+                            'occurrences': len(occurrences),
+                            'themed_cells_per_day': themed_cells_per_day,
+                            'cells_needed': n_needed,
                             'theme_filtered_pool': len(themed_pool),
                             'remaining_after_bans': n_remaining,
                         },
