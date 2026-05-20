@@ -237,6 +237,8 @@ with st.sidebar:
         clients_list if clients_list else ["(no clients)"],
         key="planner_client_select")
     start_date = st.date_input("Start date", value=dt.date.today(),
+                               min_value=dt.date(2020, 1, 1),
+                               max_value=dt.date.today() + dt.timedelta(days=730),
                                key="planner_start_date")
     num_days = st.slider("Weekdays", min_value=1, max_value=10, value=5,
                          key="planner_num_days",
