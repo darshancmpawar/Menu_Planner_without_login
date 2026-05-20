@@ -295,11 +295,13 @@ class ThemeSlotFilterRule(BaseMenuRule):
             menu silently — surfacing this lets them fix the data).
           - INFO   when the filter narrows the pool by ≥50%.
 
-        Never ERROR: this rule's design is to fall back to the
-        unfiltered pool when filtering would empty it, so it can't be
-        the *cause* of an infeasibility on its own. (The downstream
-        cuisine/coupling/item_cooldown rules emit their own errors
-        based on the data the user actually has.)
+        Also runs a multi-occurrence check: when the same (day_type,
+        slot) appears more than once in the plan (e.g. two Chinese
+        Tuesdays in a 9-day plan), verifies that enough DISTINCT items
+        survive BOTH the theme filter AND the cooldown bans to fill
+        every occurrence. Emits WARNING/ERROR when the combined pool is
+        too thin — this is the check that catches solver failures the
+        individual per-rule diagnostics miss.
         """
         diags: List[Diagnostic] = []
         cfg = ctx.cfg
@@ -309,6 +311,7 @@ class ThemeSlotFilterRule(BaseMenuRule):
 
         base_slots = ctx.active_base_slots or list(BASE_SLOT_NAMES)
 
+        # --- Per-day narrowing check (existing) ---
         for d in ctx.dates:
             day_type = ctx.day_types.get(d, '')
             if day_type not in ('chinese', 'biryani', 'south', 'north'):
@@ -377,7 +380,135 @@ class ThemeSlotFilterRule(BaseMenuRule):
                             'pool_size_after': filtered_size,
                         },
                     ))
+
+        # --- Multi-occurrence feasibility check (new) ---
+        # When a theme appears more than once (e.g. 2 Chinese Tuesdays in a
+        # 9-day plan), the solver needs N *distinct* items for that
+        # (day_type, slot) — one per occurrence. Check that enough items
+        # survive both the theme filter AND the union of cooldown bans
+        # across all those occurrences. This is the cross-rule check that
+        # catches solver failures the individual per-rule diagnostics miss.
+        day_type_dates: Dict[str, List[dt.date]] = {}
+        for d in ctx.dates:
+            dt_ = ctx.day_types.get(d, '')
+            if dt_ in ('chinese', 'biryani', 'south', 'north'):
+                day_type_dates.setdefault(dt_, []).append(d)
+
+        for day_type, dates_of_type in day_type_dates.items():
+            if len(dates_of_type) < 2:
+                continue
+
+            for base in base_slots:
+                if base in self.exempt_slots and base != 'bread':
+                    continue
+                pool = ctx.pools.get(base)
+                if pool is None or len(pool) == 0:
+                    continue
+
+                occurrences = [d for d in dates_of_type
+                               if (d, base) not in ctx.skip_cells]
+                n_needed = len(occurrences)
+                if n_needed < 2:
+                    continue
+
+                themed_pool = self._get_themed_pool(
+                    pool, base, day_type, cuisine_col, south_val, north_val,
+                )
+                if themed_pool is None or len(themed_pool) == 0:
+                    continue  # Already caught by per-day WARNING above
+
+                # Union of all cooldown-banned items across all occurrences
+                # (conservative: treats every ban as applying to every day)
+                all_banned: Set[str] = set()
+                if ctx.banned_by_date:
+                    for d in occurrences:
+                        all_banned.update(ctx.banned_by_date.get(d, set()))
+
+                remaining = themed_pool[~themed_pool['item'].isin(all_banned)]
+                n_remaining = len(remaining)
+
+                if n_remaining < n_needed:
+                    slot_label = base.replace('_', ' ')
+                    date_strs = ', '.join(d.strftime('%b %d') for d in occurrences)
+                    severity = (
+                        DiagnosticSeverity.ERROR
+                        if n_remaining == 0
+                        else DiagnosticSeverity.WARNING
+                    )
+                    diags.append(Diagnostic(
+                        rule=self.name,
+                        rule_type=self.rule_type.value,
+                        severity=severity,
+                        phase=DiagnosticPhase.PRE_FILTER,
+                        message=(
+                            f"{day_type.capitalize()} theme appears {n_needed}× "
+                            f"in this plan ({date_strs}), but only {n_remaining} "
+                            f"{slot_label} item{'s' if n_remaining != 1 else ''} "
+                            f"survive both the {day_type} theme filter and the "
+                            f"recent-history cooldown. Solver needs {n_needed} "
+                            f"distinct items — plan will likely fail."
+                        ),
+                        suggestion=(
+                            f"Add more {day_type}-tagged {slot_label} items to "
+                            f"the ontology, choose a start date that moves some "
+                            f"{day_type} days outside the cooldown window, or "
+                            f"reduce the number of planned days."
+                        ),
+                        affected={
+                            'slot': base,
+                            'day_type': day_type,
+                            'occurrences_needed': n_needed,
+                            'theme_filtered_pool': len(themed_pool),
+                            'remaining_after_bans': n_remaining,
+                        },
+                    ))
         return diags
+
+    def _get_themed_pool(
+        self,
+        pool: pd.DataFrame,
+        base_slot: str,
+        day_type: str,
+        cuisine_col: str,
+        south_val: str,
+        north_val: str,
+    ):
+        """Return the theme-filtered DataFrame for (base_slot, day_type).
+
+        Returns ``None`` when no theme filter applies to this combination
+        (caller should skip). Does NOT apply the fallback-to-unfiltered
+        behaviour — returns the filtered subset even when it is empty so
+        callers can distinguish "filter returned 0" from "no filter".
+        """
+        if day_type == 'chinese':
+            flag_col = _CHINESE_FLAG_MAP.get(base_slot)
+            if flag_col and flag_col in pool.columns:
+                return pool[pool[flag_col].map(_to_bool01) == 1]
+            if base_slot == 'veg_dry':
+                return pool[_chinese_side_mask(pool)]
+            return None
+
+        if day_type == 'biryani':
+            flag_col = _BIRYANI_FLAG_MAP.get(base_slot)
+            if flag_col and flag_col in pool.columns:
+                return pool[pool[flag_col].map(_to_bool01) == 1]
+            return None
+
+        # south / north
+        if base_slot == 'bread':
+            if cuisine_col not in pool.columns:
+                return None
+            if day_type == 'south':
+                return pool[pool[cuisine_col].map(_norm_str) == south_val]
+            return pool[pool[cuisine_col].map(_norm_str) != south_val]
+
+        if base_slot in self.exempt_slots:
+            return None
+
+        if cuisine_col not in pool.columns:
+            return None
+        target = south_val if day_type == 'south' else north_val
+        return pool[pool[cuisine_col].map(_norm_str) == target]
 
     def _project_filter_size(
         self,
