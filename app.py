@@ -238,7 +238,7 @@ with st.sidebar:
         key="planner_client_select")
     start_date = st.date_input("Start date", value=dt.date.today(),
                                key="planner_start_date")
-    num_days = st.slider("Weekdays", min_value=1, max_value=20, value=5,
+    num_days = st.slider("Weekdays", min_value=1, max_value=10, value=5,
                          key="planner_num_days",
                          help="Number of weekdays (Sat/Sun are skipped)")
 
